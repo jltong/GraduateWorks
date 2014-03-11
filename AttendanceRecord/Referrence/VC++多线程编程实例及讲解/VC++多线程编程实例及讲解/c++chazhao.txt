@@ -1,0 +1,120 @@
+其中成员函数：
+
+//设置程序主窗口句柄，要匹配的文件名，路径名
+void FinderSet(HWND MainHwnd,CString MatchName="*.*",CString MatchDir="");
+
+//设置线程数及优先级
+void ThreadSet(LONG MaxThreadCount=5,int priority=0);
+
+//搜索选项
+void FinderOption(FINDEROPTION FinderOption);
+    
+//查找操作
+BOOL StartFinder();        //开始查找
+void PauseFinder();        //暂停查找
+void ResumeFinder();       //继续查找
+void StopFinder();         //停止查找
+void FinderReset();        //查找重置
+             
+//搜索选项
+void FinderOption(FINDEROPTION FinderOption);
+每个线程通过自定义的消息与UI线程通信，反映当前的查找进度与查找结果。 //自定义通知消息==========================================================
+//WM_THREADEXIT  主线程结束    WPARAM: 结束码
+//WM_THREADCOUNT 活动线程数目  WPARAM: 线程数
+//WM_FINDERITEM  查找结果      WPARAM: 结果字符串地址  LPARAM:文件属性
+//WM_THREADPAUSE 程序暂停
+//WM_FINDERFOLDER当前查找目录  WPARAM: 目录字符串地址
+//==================================================================
+可通过ThreadSet()设置线程的数目与优先级，这样MainThreadProc()中就会产生相应数目的线程
+
+编程思路：
+
+定义一个临时目录列表CStringList m_DirList; 线程每找到一个目录就将它放在m_DirList尾，若找到的是文件，就用MatchProc()进行比较，判断是否符合查找条件。若符合就向UI线程发送消息WM_FINDERITEM，以进行界面显示。然后，线程继续在当前目录中查找直到当前目录全部查找完毕。再从m_DirList队头取一个新的目录进行查找。
+
+这里有一个要注意的地方就是m_DirList为每个线程所共有的资源，所以在访问m_DirList时要注意一下线程间的互斥，这可以用临界区操作来保证。
+
+那么，如何来判断文件查找应该结束了呢？仅判断m_DirList为空是不够的，因为当m_DirList为空时，有可能还有活动的线程，这些活动的线程可能还会产生新的未查找的目录，故只有在m_DirList为空且当前的活动线程数为0时才可以断定查找结束。(这里的"活动线程"指正在进行查找操作的线程，"非活动线程"指处于等待新的待查目录状态的线程)
+
+这部分在线程函数中实现：
+
+DWORD WINAPI CRapidFinder::ThreadProc(LPVOID lpParam)
+{
+   CRapidFinder *finder=(CRapidFinder *)lpParam;
+   CFileFind  filefinder;
+   CStringList filelist;
+   CString PathStr;
+   CString CurPath;
+   int re;
+   BYTE bNewActive=1,bOldActive;
+   CString *lpFolder=new CString;
+   while(1)
+   {
+	   bOldActive=bNewActive;
+	   if(WaitForSingleObject(finder->m_hExitEvent,0)!=WAIT_TIMEOUT)
+	   {
+		   if(bOldActive)InterlockedDecrement(&finder->m_ActiveCount);
+		   PostMessage(finder->m_MainhWnd,WM_THREADCOUNT,(WPARAM)finder->m_ActiveCount,NULL);
+		   break;
+	   }
+       
+	   if(!finder->m_ActiveCount)
+	   {
+		   SetEvent(finder->m_hExitEvent);
+		   finder->m_ExitCode=finder->EXIT;
+		   break;
+	   }
+
+  	   //进入临界区
+	   EnterCriticalSection(&finder->m_gCriticalSection);
+	   if(finder->m_DirList.IsEmpty())bNewActive=0;
+	   else 
+	   {
+		     bNewActive=1;
+		    *lpFolder=finder->m_DirList.RemoveHead();
+		     CurPath=*lpFolder+_T("\\*.*");
+	   }
+	   LeaveCriticalSection(&finder->m_gCriticalSection);
+	   //离开临界区
+	  
+	  if(bNewActive!=bOldActive)
+	  {
+		  bNewActive?InterlockedIncrement(&finder->m_ActiveCount):InterlockedDecrement(&finder->m_ActiveCount);
+		  PostMessage(finder->m_MainhWnd,WM_THREADCOUNT,(WPARAM)finder->m_ActiveCount,NULL);
+	  }
+      else if(!bNewActive) continue;
+       
+      SendMessage(finder->m_MainhWnd,WM_FINDERFOLDER,(WPARAM)lpFolder,NULL);
+
+       if(filefinder.FindFile(LPCTSTR(CurPath)))
+	   {
+		   do 
+		   {
+			   re=filefinder.FindNextFile();
+			   if(filefinder.IsDots())continue;
+			   PathStr=filefinder.GetFilePath();
+
+			   if(filefinder.IsDirectory())
+			   {
+			       EnterCriticalSection(&finder->m_gCriticalSection);
+				   finder->m_DirList.AddTail(PathStr);
+				   LeaveCriticalSection(&finder->m_gCriticalSection);
+			   }
+			   else filelist.AddTail(PathStr);
+		   }while(re);
+	   }
+	   while(!filelist.IsEmpty())
+	   {
+		   PathStr=filelist.RemoveHead();
+		   if(finder->MatchProc(PathStr))
+			   SendMessage(finder->m_MainhWnd,WM_FINDERITEM,(WPARAM)&PathStr,NULL);
+	   }
+   }
+delete lpFolder;
+filefinder.Close();
+return 0;
+}
+
+程序编译运行后，仅进行文件名查找时经测试速度比Windows自带的查找程序稍快(Win9x的查找程序是独立的，而Win2000下是集成在Explorer中的)，当线程数在5-10之间时速度最快，而超过50时速度反而变慢，这就说明了并不是线程越多越好。线程数过多，CPU的大部分开销花在线程间切换上，而且由于没有足够的待查目录，大多数的线程处在等待状态，占用了大量的系统资源，从而使速度变慢。
+当进行包含文字的查找时，我用的是KMP匹配算法，但是速度还是比Windows自带查找程序慢，不知它的原理是什么，还希望知道的朋友告知！
+本例只是多线程应用的一个极简单的例子，未免贻笑大方，笔者接触多线程编程时间不长，其中的不妥之处，还请大家指正，欢迎与我联系：jruv@163.com
+程序在Win2000，VC++6.0通过。
